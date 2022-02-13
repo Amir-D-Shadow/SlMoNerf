@@ -26,7 +26,7 @@ def load_imgs(image_dir):
     img_list = []
     for p in img_paths:
         img = imageio.imread(p)[:, :, :3]  # (H, W, 3) np.uint8
-        img = PILImage.fromarray(img).resize((512,384),PILImage.BILINEAR) #reshape (640,360)
+        img = PILImage.fromarray(img).resize((512,288),PILImage.BILINEAR) #reshape (640,360)
         img = transform(img)  # (3,H, W) 
         img_list.append(img)
 
@@ -134,7 +134,7 @@ def render_inp_frame(frame0,frame1,intermediateIndex,num_inp_frame,flowComp,ArbT
 
 def main():
 
-    scene_name = "room1"
+    scene_name = "room2"
     extractionPath = f"{os.getcwd()}/data/{scene_name}"
     outputPath     = f"{os.getcwd()}/nvs_result"
     ckpt_path = f"{os.getcwd()}/ckpt/SuperSloMo.ckpt"
@@ -150,7 +150,7 @@ def main():
 
 
     # Initialize transforms
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:3")
 
     # Initialize model
     flowComp = UNet(6, 4)

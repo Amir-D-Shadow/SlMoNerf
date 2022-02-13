@@ -186,10 +186,11 @@ def edge_aware_loss(img, disp):
     param img : (H,W,C)
     """
     mean_disp = disp.mean(0, True).mean(1, True)
-    disp = disp / (mean_disp + 1e-7)
+    normalize_disp = disp / (mean_disp + 1e-7)
+    #disp = disp / (mean_disp + 1e-7)
 
-    grad_disp_x = torch.abs(disp[:, :-1] - disp[ :, 1:]) #(H,W-1)
-    grad_disp_y = torch.abs(disp[:-1, :] - disp[ 1:, :]) #(H-1,W)
+    grad_disp_x = torch.abs(normalize_disp[:, :-1] - normalize_disp[ :, 1:]) #(H,W-1)
+    grad_disp_y = torch.abs(normalize_disp[:-1, :] - normalize_disp[ 1:, :]) #(H-1,W)
 
     grad_img_x = torch.mean(torch.abs(img[:, :-1,:] - img[:, 1:,:]), dim=-1, keepdim=False) #(H,W-1)
     grad_img_y = torch.mean(torch.abs(img[:-1, :,:] - img[1:, :,:]), dim=-1, keepdim=False) #(H-1,W)
@@ -198,3 +199,28 @@ def edge_aware_loss(img, disp):
     grad_disp_y *= torch.exp(-grad_img_y) #(H-1,W)
 
     return grad_disp_x.mean() + grad_disp_y.mean()
+
+
+def edge_sharpen_loss(img, dep):
+
+    """
+    param dep : (H,W) 
+    param img : (H,W,C)
+    """
+    #depth
+    depth_normalizing_constant = torch.max(dep).clone().detach()
+    normalize_disp = dep / (depth_normalizing_constant + 1e-7)
+
+    grad_dep_x = torch.square(normalize_disp[:,1:] - normalize_disp[:,:-1]) #(H,W-1)
+    grad_dep_y = torch.square(normalize_disp[1:,:] - normalize_disp[:-1,:]) #(H-1,W)
+
+    #img
+    img_normalizing_constant = torch.max(img).clone().detach()
+    normalize_img = img / (img_normalizing_constant + 1e-7)
+
+    grad_img_x = torch.mean(torch.square(normalize_img[:,1:,:] - normalize_img[:,:-1,:]), dim=-1, keepdim=False )#(H,W-1)
+    grad_img_y = torch.mean(torch.square(normalize_img[1:,:,:] - normalize_img[:-1,:,:]), dim=-1, keepdim=False )#(H-1,W)
+
+    grad_result = torch.square(grad_dep_x - grad_img_x).mean() + torch.square(grad_dep_y - grad_img_y).mean()
+
+    return grad_result

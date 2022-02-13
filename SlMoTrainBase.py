@@ -433,26 +433,20 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 depth_rendered = render_result['depth_map'] * 200.0
 
                 #l1 loss
-                #rgb_l1_loss = F.l1_loss(rgb_rendered/255.0,img_selected/255.0)
-                #rgb_l1_loss = rgb_l1_loss
-
-                #l2 loss
-                L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
+                rgb_l1_loss = F.l1_loss(rgb_rendered,img_selected)
+                rgb_l1_loss = rgb_l1_loss
 
                 #ssim
                 ssim_syn = rearrange( rgb_rendered.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
                 ssim_tgt = rearrange( img_selected.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
                 rgb_ssim_loss =  1 - SSIM_loss(ssim_syn,ssim_tgt)
-
-                #edge sharpen loss
-                ESL_loss = edge_sharpen_loss(img_selected,depth_rendered)
                 
                 #edge_aware_loss
                 disp =  torch.reciprocal(depth_rendered+1e-7) # (N_select_rows, N_select_cols)
                 EAL_loss = edge_aware_loss(img_selected,disp)
 
                 #total loss
-                total_loss =  rgb_ssim_loss + 0.01 * EAL_loss + 0.1 * ESL_loss + L2_loss #+ rgb_l1_loss 
+                total_loss = rgb_l1_loss + rgb_ssim_loss + 0.01*EAL_loss
 
                 #L2_loss.backward()
                 total_loss.backward()
@@ -468,8 +462,9 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
 
                 with torch.no_grad():
 
-                    #L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
-                    L2_loss_epoch.append(L2_loss.clone().detach())
+                    L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
+                    #psnr_val = psnr(rgb_rendered,img_selected)
+                    L2_loss_epoch.append(L2_loss)
                     ssim_loss_epoch.append((1-rgb_ssim_loss).clone().detach())
                     total_loss_epoch.append(total_loss.clone().detach())
 
@@ -651,7 +646,7 @@ with torch.no_grad():
     print('Rendering novel views in {0:d} x {1:d}'.format(novel_H, novel_W))
 
     #time moment
-    t = np.linspace(start=0,stop=1,num=num_steps,endpoint=False)
+    t = np.linspace(start=0,stop=1,num=num_steps,endpoint=True)
     
     novel_img_list, novel_depth_list = [], []
 
