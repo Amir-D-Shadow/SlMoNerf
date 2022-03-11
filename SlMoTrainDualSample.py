@@ -25,17 +25,17 @@ from model import *
 from helper import render_inp_frame
 
 #setting
-scene_name = "room1"
+scene_name = "room5"
 img_dir = f"{os.getcwd()}/data/{scene_name}"
 model_weight_dir = f"{os.getcwd()}/model_weights/{scene_name}"
 ckpt_path = f"{os.getcwd()}/ckpt/SuperSloMo.ckpt"
 
 load_model = False
-N_EPOCH = 2000  # set to 1000 to get slightly better results. we use 10K epoch in our paper.
+N_EPOCH = 1000  # set to 1000 to get slightly better results. we use 10K epoch in our paper.
 EVAL_INTERVAL = 50  # render an image to visualise for every this interval.
 
-device = torch.device("cuda:4")
-device_ids = [4,5]
+device = torch.device("cuda:6")
+device_ids = [6,7]
 num_of_device = len(device_ids)
 
 SSIM_loss = SSIM(size_average=True)
@@ -58,7 +58,7 @@ def load_imgs(image_dir):
     img_list = []
     for p in img_paths:
         img = imageio.imread(p)[:, :, :3]  # (H, W, 3) np.uint8
-        img = Image.fromarray(img).resize((512,384),Image.BILINEAR) #reshape (640,360)
+        img = Image.fromarray(img).resize((512,288),Image.BILINEAR) #reshape (640,360)
         img = transform(img)  # (3,H, W) 
         img_list.append(img)
 
@@ -284,6 +284,7 @@ class RayParameters():
       self.DIR_ENC_FREQ = 4   # positional encoding freq for direction
       self.num_sample_steps = TSteps - 1 
       self.num_inp_frame = 4
+      self.sparse_sample_steps = 3
 
 ray_params = RayParameters()
 
@@ -414,22 +415,11 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
 
                 # sample 32x32 pixel on an image and their rays for training.
 
-                #Discrete Sample
-                r_id = torch.randperm(H, device=device)[:100]  # (N_select_rows)
-                c_id = torch.randperm(W, device=device)[:64]  # (N_select_cols)
-                ray_selected_cam = ray_dir_cam[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
-                img_selected = img[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
-
-                render_result = model_render_image(time_pose_net,t_idx,c2w, ray_selected_cam, t_vals, ray_params,H, W, fxfy, nerf_model, perturb_t=True, sigma_noise_std=0.0)
-                rgb_rendered = render_result['rgb'] * 255.0  # (N_select_rows, N_select_cols, 3)
-
-                #l2 loss
-                L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)
-
                 #Continuous Sample
-                row_list = [(rs_i,rs_i+100) for rs_i in range(H-100+1)]
+                row_size,col_size = 96,64 
+                row_list = [(rs_i,rs_i+row_size) for rs_i in range(H-row_size+1)]
                 random.shuffle(row_list)
-                col_list = [(cs_j,cs_j+64) for cs_j in range(W-64+1)]
+                col_list = [(cs_j,cs_j+col_size) for cs_j in range(W-col_size+1)]
                 random.shuffle(col_list)
 
                 row_start , row_end = row_list[0]
@@ -443,8 +433,8 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 depth_rendered = render_result['depth_map'] * 200.0
 
                 #l1 loss
-                rgb_l1_loss = F.l1_loss(rgb_rendered/255.0,img_selected/255.0)
-                rgb_l1_loss = rgb_l1_loss
+                #rgb_l1_loss = F.l1_loss(rgb_rendered/255.0,img_selected/255.0)
+                #rgb_l1_loss = rgb_l1_loss
 
                 #ssim
                 ssim_syn = rearrange( rgb_rendered.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
@@ -458,8 +448,24 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 disp =  torch.reciprocal(depth_rendered+1e-7) # (N_select_rows, N_select_cols)
                 EAL_loss = edge_aware_loss(img_selected,disp)
 
+                #discrete l2 loss   
+                L2_loss = []   
+                for i in range(ray_params.sparse_sample_steps):       
+
+                    r_id = torch.randperm(row_size, device=device)[:16]  # (N_select_rows)
+                    c_id = torch.randperm(col_size, device=device)[:16]  # (N_select_cols)
+                    ray_selected_cam_dis = ray_selected_cam[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
+                    img_selected_dis = img_selected[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
+
+                    # render an image using selected rays, pose, sample intervals, and the network
+                    render_result_dis = model_render_image(time_pose_net,t_idx,c2w, ray_selected_cam_dis, t_vals, ray_params,H, W, fxfy, nerf_model, perturb_t=True, sigma_noise_std=0.0)
+                    rgb_rendered_dis = render_result_dis['rgb'] * 255.0 # (N_select_rows, N_select_cols, 3)
+                    L2_loss.append( F.mse_loss(rgb_rendered_dis/255.0, img_selected_dis/255.0) )
+                
+                L2_loss = torch.stack( L2_loss ).mean()
+
                 #total loss
-                total_loss =  rgb_ssim_loss + 0.01 * EAL_loss + 0.1 * ESL_loss + L2_loss + rgb_l1_loss 
+                total_loss =  rgb_ssim_loss + 0.01 * EAL_loss + 0.01 * ESL_loss + L2_loss #+ rgb_l1_loss 
 
                 #L2_loss.backward()
                 total_loss.backward()

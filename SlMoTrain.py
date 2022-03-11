@@ -413,19 +413,21 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 c2w = pose_param_net(i)  # (4, 4)
 
                 # sample 32x32 pixel on an image and their rays for training.
-                #r_id = torch.randperm(H, device=device)[:172]  # (N_select_rows)
-                #_id = torch.randperm(W, device=device)[:64]  # (N_select_cols)
-                #ray_selected_cam = ray_dir_cam[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
-                #img_selected = img[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
-                row_list = [(rs_i,rs_i+100) for rs_i in range(H-100+1)]
-                random.shuffle(row_list)
-                col_list = [(cs_j,cs_j+64) for cs_j in range(W-64+1)]
-                random.shuffle(col_list)
+                #row_list = [(rs_i,rs_i+100) for rs_i in range(H-100+1)]
+                #random.shuffle(row_list)
+                #col_list = [(cs_j,cs_j+64) for cs_j in range(W-64+1)]
+                #random.shuffle(col_list)
 
-                row_start , row_end = row_list[0]
-                col_start , col_end = col_list[0]
-                ray_selected_cam = ray_dir_cam[row_start:row_end,col_start:col_end,:]
-                img_selected = img[row_start:row_end,col_start:col_end,:]
+                #row_start , row_end = row_list[0]
+                #col_start , col_end = col_list[0]
+                #ray_selected_cam = ray_dir_cam[row_start:row_end,col_start:col_end,:]
+                #img_selected = img[row_start:row_end,col_start:col_end,:]
+
+                row_start = torch.randperm(H-100+1,device=device)[0]
+                col_start = torch.randperm(W-64+1,device=device)[0]
+
+                ray_selected_cam = ray_dir_cam[row_start:row_start+100][:,col_start:col_start+64]
+                img_selected = img[row_start:row_start+100][:,col_start:col_start+64]
 
                 # render an image using selected rays, pose, sample intervals, and the network
                 render_result = model_render_image(time_pose_net,t_idx,c2w, ray_selected_cam, t_vals, ray_params,H, W, fxfy, nerf_model, perturb_t=True, sigma_noise_std=0.0)
@@ -433,11 +435,7 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 depth_rendered = render_result['depth_map'] * 200.0
 
                 #l1 loss
-                #rgb_l1_loss = F.l1_loss(rgb_rendered/255.0,img_selected/255.0)
-                #rgb_l1_loss = rgb_l1_loss
-
-                #l2 loss
-                L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
+                rgb_l1_loss = F.l1_loss(rgb_rendered/255.0,img_selected/255.0)
 
                 #ssim
                 ssim_syn = rearrange( rgb_rendered.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
@@ -452,7 +450,7 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 EAL_loss = edge_aware_loss(img_selected,disp)
 
                 #total loss
-                total_loss =  rgb_ssim_loss + 0.01 * EAL_loss + 0.1 * ESL_loss + L2_loss #+ rgb_l1_loss 
+                total_loss =  rgb_ssim_loss + 0.01 * EAL_loss + 0.01 * ESL_loss + rgb_l1_loss 
 
                 #L2_loss.backward()
                 total_loss.backward()
@@ -468,7 +466,7 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
 
                 with torch.no_grad():
 
-                    #L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
+                    L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
                     L2_loss_epoch.append(L2_loss.clone().detach())
                     ssim_loss_epoch.append((1-rgb_ssim_loss).clone().detach())
                     total_loss_epoch.append(total_loss.clone().detach())

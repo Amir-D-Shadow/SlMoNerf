@@ -1,4 +1,5 @@
 import os, random, datetime
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,13 +26,13 @@ from model import *
 from helper import render_inp_frame
 
 #setting
-scene_name = "room1"
+scene_name = "room5"
 img_dir = f"{os.getcwd()}/data/{scene_name}"
 model_weight_dir = f"{os.getcwd()}/model_weights/{scene_name}"
 ckpt_path = f"{os.getcwd()}/ckpt/SuperSloMo.ckpt"
 
 load_model = False
-N_EPOCH = 2000  # set to 1000 to get slightly better results. we use 10K epoch in our paper.
+N_EPOCH = 1000  # set to 1000 to get slightly better results. we use 10K epoch in our paper.
 EVAL_INTERVAL = 50  # render an image to visualise for every this interval.
 
 device = torch.device("cuda:4")
@@ -58,7 +59,7 @@ def load_imgs(image_dir):
     img_list = []
     for p in img_paths:
         img = imageio.imread(p)[:, :, :3]  # (H, W, 3) np.uint8
-        img = Image.fromarray(img).resize((512,384),Image.BILINEAR) #reshape (640,360)
+        img = Image.fromarray(img).resize((512,288),Image.BILINEAR) #reshape (640,360)
         img = transform(img)  # (3,H, W) 
         img_list.append(img)
 
@@ -413,6 +414,13 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 c2w = pose_param_net(i)  # (4, 4)
 
                 # sample 32x32 pixel on an image and their rays for training.
+                #sparse 
+                #r_id = torch.randperm(H, device=device)[:172]  # (N_select_rows)
+                #_id = torch.randperm(W, device=device)[:64]  # (N_select_cols)
+                #ray_selected_cam = ray_dir_cam[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
+                #img_selected = img[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
+
+                #continuous
                 #row_list = [(rs_i,rs_i+100) for rs_i in range(H-100+1)]
                 #random.shuffle(row_list)
                 #col_list = [(cs_j,cs_j+64) for cs_j in range(W-64+1)]
@@ -435,20 +443,22 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 depth_rendered = render_result['depth_map'] * 200.0
 
                 #l1 loss
-                rgb_l1_loss = F.l1_loss(rgb_rendered/255.0,img_selected/255.0)
-                rgb_l1_loss = rgb_l1_loss
+                rgb_l1_loss = F.l1_loss(rgb_rendered,img_selected)
 
                 #ssim
                 ssim_syn = rearrange( rgb_rendered.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
                 ssim_tgt = rearrange( img_selected.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
                 rgb_ssim_loss =  1 - SSIM_loss(ssim_syn,ssim_tgt)
+
+                #edge sharpen loss
+                ESL_loss = edge_sharpen_loss(img_selected,depth_rendered)
                 
                 #edge_aware_loss
                 disp =  torch.reciprocal(depth_rendered+1e-7) # (N_select_rows, N_select_cols)
                 EAL_loss = edge_aware_loss(img_selected,disp)
 
                 #total loss
-                total_loss = rgb_l1_loss + rgb_ssim_loss + 0.01*EAL_loss
+                total_loss =  rgb_ssim_loss + 0.01 * EAL_loss + 0.01 * ESL_loss + rgb_l1_loss 
 
                 #L2_loss.backward()
                 total_loss.backward()
@@ -465,8 +475,7 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 with torch.no_grad():
 
                     L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
-                    #psnr_val = psnr(rgb_rendered,img_selected)
-                    L2_loss_epoch.append(L2_loss)
+                    L2_loss_epoch.append(L2_loss.clone().detach())
                     ssim_loss_epoch.append((1-rgb_ssim_loss).clone().detach())
                     total_loss_epoch.append(total_loss.clone().detach())
 
@@ -586,7 +595,7 @@ scheduler_time = MultiStepLR(opt_time, milestones=list(range(0, 10000, 100)), ga
 writer = SummaryWriter(log_dir=os.path.join('logs', scene_name, str(datetime.datetime.now().strftime('%y%m%d_%H%M%S'))))
 
 # Training
-print('Start Training...')
+print(f"Start Training {scene_name} ...")
 for epoch_i in tqdm(range(N_EPOCH), desc='Training'):
     
     Tr_loss = train_one_epoch(image_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,opt_time, nerf_model, focal_net, pose_param_net,time_pose_net,flowComp,ArbTimeFlowIntrp,flowBackWarp)
@@ -618,8 +627,14 @@ for epoch_i in tqdm(range(N_EPOCH), desc='Training'):
             fxfy = focal_net()
             rendered_img, rendered_depth = render_novel_view(((epoch_i+1)%TSteps)/TSteps,eval_c2w, H, W, fxfy, ray_params, nerf_model,time_pose_net)
             imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_img{epoch_i+1}_SlMo.png"),(rendered_img*255).cpu().numpy().astype(np.uint8))
-            imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_depth{epoch_i+1}_SlMoF.png"),(rendered_depth*200).cpu().numpy().astype(np.uint8))
+            imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_depth{epoch_i+1}_SlMo.png"),(rendered_depth*200).cpu().numpy().astype(np.uint8))
 
+            Tr_status = {"PSNR":str(train_psnr),"SSIM":str(Tr_loss[1])}
+            with open(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", f"{scene_name}_record.txt"),"w") as file:
+
+                file.write(json.dumps(Tr_status))
+
+            file.close()
 
 
 print('Training Completed !!!')
@@ -648,7 +663,7 @@ with torch.no_grad():
     print('Rendering novel views in {0:d} x {1:d}'.format(novel_H, novel_W))
 
     #time moment
-    t = np.linspace(start=0,stop=1,num=num_steps,endpoint=True)
+    t = np.linspace(start=0,stop=1,num=num_steps,endpoint=False)
     
     novel_img_list, novel_depth_list = [], []
 

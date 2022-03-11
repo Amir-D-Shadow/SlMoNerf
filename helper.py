@@ -26,7 +26,7 @@ def load_imgs(image_dir):
     img_list = []
     for p in img_paths:
         img = imageio.imread(p)[:, :, :3]  # (H, W, 3) np.uint8
-        img = PILImage.fromarray(img).resize((512,288),PILImage.BILINEAR) #reshape (640,360)
+        img = PILImage.fromarray(img).resize((512,384),PILImage.BILINEAR) #reshape (640,360)
         img = transform(img)  # (3,H, W) 
         img_list.append(img)
 
@@ -131,10 +131,66 @@ def render_inp_frame(frame0,frame1,intermediateIndex,num_inp_frame,flowComp,ArbT
 
         return torch.from_numpy( np.stack(result,axis=0) ).float() #(N,H,W,3)
     
+def flow_inp_frame(frame0,frame1,intermediateIndex,num_inp_frame,flowComp,ArbTimeFlowIntrp,flowBackWarp):
+
+    #set up
+    mean = [0.429, 0.431, 0.397]
+    std  = [1, 1, 1]
+
+    negmean = [x * -1 for x in mean]
+    revNormalize = transforms.Normalize(mean=negmean, std=std)
+    
+    TP = transforms.Compose([revNormalize,transforms.ToPILImage()])
+
+    with torch.no_grad():
+
+        I0 = frame0
+        I1 = frame1
+
+        flowOut = flowComp(torch.cat((I0, I1), dim=1))
+        F_0_1 = flowOut[:,:2,:,:]
+        F_1_0 = flowOut[:,2:,:,:]
+
+        # Generate intermediate frames
+        t = 1. / 2
+        temp = -t * (1 - t)
+        fCoeff = [temp, t * t, (1 - t) * (1 - t), temp]
+
+        F_t_0 = fCoeff[0] * F_0_1 + fCoeff[1] * F_1_0
+        F_t_1 = fCoeff[2] * F_0_1 + fCoeff[3] * F_1_0
+
+        g_I0_F_t_0 = flowBackWarp(I0, F_t_0)
+        g_I1_F_t_1 = flowBackWarp(I1, F_t_1)
+
+        intrpOut = ArbTimeFlowIntrp(torch.cat((I0, I1, F_0_1, F_1_0, F_t_1, F_t_0, g_I1_F_t_1, g_I0_F_t_0), dim=1))
+
+        F_t_0_f = intrpOut[:, :2, :, :] + F_t_0
+        F_t_1_f = intrpOut[:, 2:4, :, :] + F_t_1
+        V_t_0   = torch.sigmoid(intrpOut[:, 4:5, :, :])
+        V_t_1   = 1 - V_t_0
+
+        g_I0_F_t_0_f = flowBackWarp(I0, F_t_0_f)
+        g_I1_F_t_1_f = flowBackWarp(I1, F_t_1_f)
+
+        wCoeff = [1 - t, t]
+
+        Ft_p = (wCoeff[0] * V_t_0 * g_I0_F_t_0_f + wCoeff[1] * V_t_1 * g_I1_F_t_1_f) / (wCoeff[0] * V_t_0 + wCoeff[1] * V_t_1) #(N,3,H,W)
+
+        # Save intermediate frame
+        N_CAMS = Ft_p.shape[0]
+        result = []
+        for batchIndex in range(N_CAMS):
+            result.append( TP(Ft_p[batchIndex].cpu()) )
+
+        return torch.from_numpy( np.stack(result,axis=0) ).float() #(N,H,W,3)
+
+        # return V_t_0, V_t_1, g_I0_F_t_0_f, g_I1_F_t_1_f, wCoeff
+    
+
 
 def main():
 
-    scene_name = "room2"
+    scene_name = "room6"
     extractionPath = f"{os.getcwd()}/data/{scene_name}"
     outputPath     = f"{os.getcwd()}/nvs_result"
     ckpt_path = f"{os.getcwd()}/ckpt/SuperSloMo.ckpt"
@@ -150,7 +206,7 @@ def main():
 
 
     # Initialize transforms
-    device = torch.device("cuda:3")
+    device = torch.device("cuda:9")
 
     # Initialize model
     flowComp = UNet(6, 4)

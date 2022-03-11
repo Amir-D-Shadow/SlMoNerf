@@ -25,22 +25,23 @@ from model import *
 from helper import render_inp_frame
 
 #setting
-scene_name = "room1"
+scene_name = "room7"
 img_dir = f"{os.getcwd()}/data/{scene_name}"
 model_weight_dir = f"{os.getcwd()}/model_weights/{scene_name}"
 ckpt_path = f"{os.getcwd()}/ckpt/SuperSloMo.ckpt"
 
-load_model = False
-N_EPOCH = 2000  # set to 1000 to get slightly better results. we use 10K epoch in our paper.
+load_model = True
+N_EPOCH = 0  # set to 1000 to get slightly better results. we use 10K epoch in our paper.
 EVAL_INTERVAL = 50  # render an image to visualise for every this interval.
 
-device = torch.device("cuda:4")
-device_ids = [4,5]
+device = torch.device("cuda:0")
+device_ids = [0,1]
 num_of_device = len(device_ids)
-
+"""
 SSIM_loss = SSIM(size_average=True)
 SSIM_loss = nn.DataParallel(SSIM_loss,device_ids=device_ids)
 SSIM_loss.to(device)
+"""
 
 #load data
 def load_imgs(image_dir):
@@ -58,7 +59,7 @@ def load_imgs(image_dir):
     img_list = []
     for p in img_paths:
         img = imageio.imread(p)[:, :, :3]  # (H, W, 3) np.uint8
-        img = Image.fromarray(img).resize((512,384),Image.BILINEAR) #reshape (640,360)
+        img = Image.fromarray(img).resize((512,288),Image.BILINEAR) #reshape (640,360)
         img = transform(img)  # (3,H, W) 
         img_list.append(img)
 
@@ -123,7 +124,7 @@ print('Loaded {0} imgs, resolution {1} x {2}'.format(N_IMGS*TSteps, H, W))
 class LearnFocal(nn.Module):
     def __init__(self, H, W, req_grad):
         super(LearnFocal, self).__init__()
-        self.H = H
+        self.H = W#H
         self.W = W
         self.fx = nn.Parameter(torch.tensor(1.0, dtype=torch.float32), requires_grad=req_grad)  # (1, )
         self.fy = nn.Parameter(torch.tensor(1.0, dtype=torch.float32), requires_grad=req_grad)  # (1, )
@@ -193,7 +194,8 @@ class LearnTime(nn.Module):
 
       self.TimeLayer1 = nn.Linear(in_features=in_feat,out_features=mid_feat)
       self.TimeLayer2 = nn.Linear(in_features=mid_feat,out_features=out_feat)
-      self.act_fn1 = nn.ReLU()
+      self.act_fn1 = nn.LeakyReLU(negative_slope = 0.03)
+      self.act_fn2 = nn.LeakyReLU(negative_slope = 0.03)
 
    def forward(self,x):
 
@@ -204,7 +206,9 @@ class LearnTime(nn.Module):
       timeStep = self.TimeLayer1(x)
       timeStep = self.act_fn1(timeStep)
 
-      final_output = self.TimeLayer2(timeStep)
+      timeStep = self.TimeLayer2(timeStep)
+      #(H,W,out_feat)
+      final_output = self.act_fn2(timeStep)
 
       return final_output
 
@@ -282,6 +286,7 @@ class RayParameters():
       self.N_SAMPLE = 128  # samples per ray
       self.POS_ENC_FREQ = 10  # positional encoding freq for location
       self.DIR_ENC_FREQ = 4   # positional encoding freq for direction
+      self.Time_ENC_FREQ = 4
       self.num_sample_steps = TSteps - 1 
       self.num_inp_frame = 4
 
@@ -306,10 +311,10 @@ def model_render_image(time_pose_net,T_momen,c2w, rays_cam, t_vals, ray_params, 
     sample_pos, _, ray_dir_world, t_vals_noisy = volume_sampling_ndc(c2w, rays_cam, t_vals, ray_params.NEAR,ray_params.FAR, H, W, fxfy, perturb_t)
 
     #bulid Time tensor (H,W,N_sample,out_feat)
-    timeTensor = torch.full_like(ray_dir_world[:,:,:1],fill_value=T_momen,dtype=torch.float32,device=ray_dir_world.device) #(H,W,1)
-    timeTensor = encode_position(timeTensor,levels = 4,inc_input=True)        #(H,W,9)
-    timeTensor = time_pose_net(timeTensor)                                    #(H,W,27)
-    timeTensor = timeTensor.unsqueeze(2).expand(-1,-1,ray_params.N_SAMPLE,-1) #(H,W,N_sample,27)
+    timeTensor = torch.full_like(ray_dir_world,fill_value=T_momen,dtype=torch.float32,device=ray_dir_world.device) #(H,W,3)
+    timeTensor = time_pose_net(timeTensor)                                    #(H,W,out_feat)
+    timeTensor = timeTensor.unsqueeze(2).expand(-1,-1,ray_params.N_SAMPLE,-1) #(H,W,N_sample,out_feat)
+    timeTensor = encode_position(timeTensor, levels=ray_params.Time_ENC_FREQ, inc_input=True)
     
     # encode position: (H, W, N_sample, (2L+1)*C = 63)
     pos_enc = encode_position(sample_pos, levels=ray_params.POS_ENC_FREQ, inc_input=True)
@@ -359,9 +364,7 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
 
     t_vals = torch.linspace(ray_params.NEAR, ray_params.FAR, ray_params.N_SAMPLE, device=device)  # (N_sample,) sample position
 
-    total_loss_epoch = []
     L2_loss_epoch = []
-    ssim_loss_epoch = []
     
     #shuffle the time steps
     time_list = [ i for i in range(TSteps-1)]
@@ -413,45 +416,19 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 c2w = pose_param_net(i)  # (4, 4)
 
                 # sample 32x32 pixel on an image and their rays for training.
-                #row_list = [(rs_i,rs_i+100) for rs_i in range(H-100+1)]
-                #random.shuffle(row_list)
-                #col_list = [(cs_j,cs_j+64) for cs_j in range(W-64+1)]
-                #random.shuffle(col_list)
-
-                #row_start , row_end = row_list[0]
-                #col_start , col_end = col_list[0]
-                #ray_selected_cam = ray_dir_cam[row_start:row_end,col_start:col_end,:]
-                #img_selected = img[row_start:row_end,col_start:col_end,:]
-
-                row_start = torch.randperm(H-100+1,device=device)[0]
-                col_start = torch.randperm(W-64+1,device=device)[0]
-
-                ray_selected_cam = ray_dir_cam[row_start:row_start+100][:,col_start:col_start+64]
-                img_selected = img[row_start:row_start+100][:,col_start:col_start+64]
+                r_id = torch.randperm(H, device=device)[:90]  # (N_select_rows)
+                c_id = torch.randperm(W, device=device)[:64]  # (N_select_cols)
+                ray_selected_cam = ray_dir_cam[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
+                img_selected = img[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
 
                 # render an image using selected rays, pose, sample intervals, and the network
                 render_result = model_render_image(time_pose_net,t_idx,c2w, ray_selected_cam, t_vals, ray_params,H, W, fxfy, nerf_model, perturb_t=True, sigma_noise_std=0.0)
                 rgb_rendered = render_result['rgb'] * 255.0  # (N_select_rows, N_select_cols, 3)
-                depth_rendered = render_result['depth_map'] * 200.0
 
-                #l1 loss
-                rgb_l1_loss = F.l1_loss(rgb_rendered/255.0,img_selected/255.0)
-                rgb_l1_loss = rgb_l1_loss
+                #l2 loss
+                L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
 
-                #ssim
-                ssim_syn = rearrange( rgb_rendered.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
-                ssim_tgt = rearrange( img_selected.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
-                rgb_ssim_loss =  1 - SSIM_loss(ssim_syn,ssim_tgt)
-                
-                #edge_aware_loss
-                disp =  torch.reciprocal(depth_rendered+1e-7) # (N_select_rows, N_select_cols)
-                EAL_loss = edge_aware_loss(img_selected,disp)
-
-                #total loss
-                total_loss = rgb_l1_loss + rgb_ssim_loss + 0.01*EAL_loss
-
-                #L2_loss.backward()
-                total_loss.backward()
+                L2_loss.backward()
                 opt_nerf.step()
                 opt_focal.step()
                 opt_pose.step()
@@ -464,20 +441,14 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
 
                 with torch.no_grad():
 
-                    L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
-                    #psnr_val = psnr(rgb_rendered,img_selected)
-                    L2_loss_epoch.append(L2_loss)
-                    ssim_loss_epoch.append((1-rgb_ssim_loss).clone().detach())
-                    total_loss_epoch.append(total_loss.clone().detach())
-
+                    #L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
+                    L2_loss_epoch.append(L2_loss.clone().detach())
 
 
     L2_loss_epoch_mean = torch.stack(L2_loss_epoch).mean().item()
-    ssim_loss_epoch_mean = torch.stack(ssim_loss_epoch).mean().item()
-    total_loss_epoch_mean = torch.stack(total_loss_epoch).mean().item()
 
     #[L2_loss_epoch_mean,0,total_loss_epoch_mean]
-    return [L2_loss_epoch_mean,ssim_loss_epoch_mean,total_loss_epoch_mean]
+    return L2_loss_epoch_mean
 
 #Define evaluation function***
 def render_novel_view(T_momen,c2w, H, W, fxfy, ray_params, nerf_model,time_pose_net):
@@ -489,7 +460,7 @@ def render_novel_view(T_momen,c2w, H, W, fxfy, ray_params, nerf_model,time_pose_
     c2w = c2w.to(device)  # (4, 4)
 
     # split an image to rows when the input image resolution is high
-    rays_dir_cam_split_rows = ray_dir_cam.split(10, dim=0)  # input 10 rows each time
+    rays_dir_cam_split_rows = ray_dir_cam.split(16, dim=0)  # input 10 rows each time
     rendered_img = []
     rendered_depth = []
     
@@ -552,6 +523,7 @@ if load_model:
 pose_param_net = nn.DataParallel(pose_param_net,device_ids=device_ids)
 pose_param_net.to(device) 
 
+"""
 time_pose_net = LearnTime(in_feat=9,mid_feat=32,out_feat=27)
 if load_model:
 
@@ -559,7 +531,14 @@ if load_model:
 
 time_pose_net = nn.DataParallel(time_pose_net,device_ids=device_ids)
 time_pose_net.to(device)
+"""
+time_pose_net = LearnTime(in_feat=3,mid_feat=32,out_feat=3)
+if load_model:
 
+    time_pose_net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_time.pt",map_location = device))
+
+time_pose_net = nn.DataParallel(time_pose_net,device_ids=device_ids)
+time_pose_net.to(device)
 
 # Get a  NeRF model. Hidden dimension set to 256
 nerf_model = Nerf(tpos_in_dims=90, dir_in_dims=27, D=256)
@@ -586,15 +565,17 @@ scheduler_time = MultiStepLR(opt_time, milestones=list(range(0, 10000, 100)), ga
 writer = SummaryWriter(log_dir=os.path.join('logs', scene_name, str(datetime.datetime.now().strftime('%y%m%d_%H%M%S'))))
 
 # Training
-print('Start Training...')
+import json
+"""
+print(f"Start Training {scene_name} ...")
 for epoch_i in tqdm(range(N_EPOCH), desc='Training'):
     
     Tr_loss = train_one_epoch(image_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,opt_time, nerf_model, focal_net, pose_param_net,time_pose_net,flowComp,ArbTimeFlowIntrp,flowBackWarp)
-    train_psnr = mse2psnr(Tr_loss[0])
+    train_psnr = mse2psnr(Tr_loss)
  
     fxfy = focal_net()
     #print('epoch {0:4d} Training PSNR {1:.3f}, estimated fx {2:.1f} fy {3:.1f}'.format(epoch_i, train_psnr, fxfy[0], fxfy[1]))
-    print(f"epoch {epoch_i+1}: Training PSNR {train_psnr}, SSIM: {Tr_loss[1]}, Total Loss: {Tr_loss[2]}, estimated fx {fxfy[0]} fy {fxfy[1]}")
+    print(f"epoch {epoch_i+1}: Training PSNR {train_psnr}, estimated fx {fxfy[0]} fy {fxfy[1]}")
 
     scheduler_nerf.step()
     scheduler_focal.step()
@@ -616,14 +597,20 @@ for epoch_i in tqdm(range(N_EPOCH), desc='Training'):
             
             eval_c2w = torch.eye(4, dtype=torch.float32)  # (4, 4)
             fxfy = focal_net()
-            rendered_img, rendered_depth = render_novel_view(((epoch_i+1)%TSteps)/TSteps,eval_c2w, H, W, fxfy, ray_params, nerf_model,time_pose_net)
+            rendered_img, rendered_depth = render_novel_view((TSteps//2)/TSteps,eval_c2w, H, W, fxfy, ray_params, nerf_model,time_pose_net)
             imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_img{epoch_i+1}_SlMo.png"),(rendered_img*255).cpu().numpy().astype(np.uint8))
-            imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_depth{epoch_i+1}_SlMoF.png"),(rendered_depth*200).cpu().numpy().astype(np.uint8))
+            imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_depth{epoch_i+1}_SlMo.png"),(rendered_depth*200).cpu().numpy().astype(np.uint8))
 
+            Tr_status = {"PSNR":str(train_psnr)}
+            with open(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", f"{scene_name}_record.txt"),"w") as file:
+
+                file.write(json.dumps(Tr_status))
+
+            file.close()
 
 
 print('Training Completed !!!')
-
+"""
 
 # Novel View Synthesis
 # Render novel views from a sprial camera trajectory.
@@ -631,11 +618,11 @@ import time
 
 # Render full images are time consuming, especially on colab so we render a smaller version instead.
 resize_ratio = 1
-num_steps = TSteps * 2
+num_steps = TSteps * 4
 with torch.no_grad():
     
     optimised_poses = torch.stack([pose_param_net(i) for i in range(N_IMGS)])
-    radii = np.percentile(np.abs(optimised_poses.cpu().numpy()[:, :3, 3]), q=75, axis=0)  # (3,)
+    radii = np.percentile(np.abs(optimised_poses.cpu().numpy()[:, :3, 3]), q=65, axis=0)  # (3,)
     spiral_c2ws = create_spiral_poses(radii, focus_depth=3.5, n_poses=num_steps, n_circle=1)
     spiral_c2ws = torch.from_numpy(spiral_c2ws).float()  # (N, 3, 4)
 
@@ -648,27 +635,32 @@ with torch.no_grad():
     print('Rendering novel views in {0:d} x {1:d}'.format(novel_H, novel_W))
 
     #time moment
-    t = np.linspace(start=0,stop=1,num=num_steps,endpoint=True)
+    t = np.linspace(start=0,stop=1,num=num_steps,endpoint=False)
     
-    novel_img_list, novel_depth_list = [], []
-
+    os.makedirs(f"{os.getcwd()}/video/{scene_name}",exist_ok=True)
+    #novel_img_list, novel_depth_list = [], []
+    writer_rgb = imageio.get_writer(f'{os.getcwd()}/video/{scene_name}/L_{scene_name}_RGB.mp4', fps=20)
+    writer_depth = imageio.get_writer(f'{os.getcwd()}/video/{scene_name}/L_{scene_name}_depth.mp4', fps=20)
     #record processing time
     curr_time = time.time()
-
     #render images
     for i in tqdm(range(spiral_c2ws.shape[0]), desc='novel view rendering'):
         
         novel_img, novel_depth = render_novel_view(t[i],spiral_c2ws[i], novel_H, novel_W, novel_fxfy,ray_params, nerf_model,time_pose_net)
         
-        novel_img_list.append(novel_img)
-        novel_depth_list.append(novel_depth)
+        writer_rgb.append_data( (novel_img*255).cpu().numpy().astype(np.uint8) )
+        writer_depth.append_data( (novel_depth*200).cpu().numpy().astype(np.uint8) )
+        #novel_img_list.append(novel_img)
+        #novel_depth_list.append(novel_depth)
 
-    print('Novel view rendering done. Saving to GIF images...')
+    #print('Novel view rendering done. Saving to GIF images...')
     print(f"It takes {time.time()-curr_time} to  complete the whole process")
-    novel_img_list = (torch.stack(novel_img_list) * 255).cpu().numpy().astype(np.uint8)
-    novel_depth_list = (torch.stack(novel_depth_list) * 200).cpu().numpy().astype(np.uint8)  # depth is always in 0 to 1 in NDC
-
+    #novel_img_list = (torch.stack(novel_img_list) * 255).cpu().numpy().astype(np.uint8)
+    #novel_depth_list = (torch.stack(novel_depth_list) * 185).cpu().numpy().astype(np.uint8)  # depth is always in 0 to 1 in NDC
+    writer_rgb.close()
+    writer_depth.close()
     #os.makedirs('nvs_results', exist_ok=True)
-    imageio.mimwrite(os.path.join(f"{os.getcwd()}/nvs_result", scene_name + '_img.gif'), novel_img_list, fps=30)
-    imageio.mimwrite(os.path.join(f"{os.getcwd()}/nvs_result", scene_name + '_depth.gif'), novel_depth_list, fps=30)
-    print('GIF images saved.')
+    #imageio.mimwrite(os.path.join(f"{os.getcwd()}/nvs_result", scene_name + '_img.gif'), novel_img_list, fps=30)
+    #imageio.mimwrite(os.path.join(f"{os.getcwd()}/nvs_result", scene_name + '_depth.gif'), novel_depth_list, fps=30)
+    #print('GIF images saved.')
+    print('MP4 video saved.')

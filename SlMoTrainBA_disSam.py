@@ -1,3 +1,4 @@
+import math
 import os, random, datetime
 import torch
 import torch.nn as nn
@@ -31,16 +32,18 @@ model_weight_dir = f"{os.getcwd()}/model_weights/{scene_name}"
 ckpt_path = f"{os.getcwd()}/ckpt/SuperSloMo.ckpt"
 
 load_model = False
-N_EPOCH = 2000  # set to 1000 to get slightly better results. we use 10K epoch in our paper.
+N_EPOCH = 1000  # set to 1000 to get slightly better results. we use 10K epoch in our paper.
 EVAL_INTERVAL = 50  # render an image to visualise for every this interval.
 
 device = torch.device("cuda:4")
 device_ids = [4,5]
 num_of_device = len(device_ids)
 
+"""
 SSIM_loss = SSIM(size_average=True)
 SSIM_loss = nn.DataParallel(SSIM_loss,device_ids=device_ids)
 SSIM_loss.to(device)
+"""
 
 #load data
 def load_imgs(image_dir):
@@ -275,6 +278,47 @@ class Nerf(nn.Module):
 
         return rgb_den
 
+#pos enc net
+class PosEncNet(nn.Module):
+
+    def __init__(self,levels,inc_input = True,init_val = 0):
+
+        super(PosEncNet,self).__init__()
+
+        self.levels = levels
+        self.inc_input = inc_input
+
+        self.alpha = nn.Parameter(torch.tensor(init_val,dtype=torch.float32), requires_grad=True)  #scalar
+
+    def forward(self,x):
+
+        """
+        :param x:       (..., C)            torch.float32
+        :param levels:  scalar L            int
+        :return:        (..., C*(2L+1))     torch.float32  if inc_input = True 
+                        (..., C*(2L))       torch.float32  otherwise     
+        """
+
+        if self.inc_input:
+
+            result = [x]
+
+        else:
+
+            result = []
+
+        for k in range(self.levels):
+
+            spectrum = (2**k) * (np.pi) * x  #(..., C)
+            weight = (1 - torch.cos( (self.alpha - k).clamp(min=0,max=1) * np.pi ) ) / 2
+            result.append( weight * torch.sin(spectrum) )
+            result.append( weight * torch.cos(spectrum) )
+
+        result_output = torch.cat(result,dim=-1)  # (..., C*(2L+1)) The list has (2L+1) elements, with (..., C) shape each.
+
+        return result_output
+
+
 #Set ray parameters
 class RayParameters():
     def __init__(self):
@@ -288,7 +332,7 @@ class RayParameters():
 ray_params = RayParameters()
 
 #Define training function***
-def model_render_image(time_pose_net,T_momen,c2w, rays_cam, t_vals, ray_params, H, W, fxfy, nerf_model,perturb_t, sigma_noise_std):
+def model_render_image(T_momen,time_pose_net,pos_enc_Net,time_enc_Net,dir_enc_Net,c2w, rays_cam, t_vals, ray_params, H, W, fxfy, nerf_model,perturb_t, sigma_noise_std):
 
     """
     :param time_pose_net  model that learn time
@@ -307,19 +351,19 @@ def model_render_image(time_pose_net,T_momen,c2w, rays_cam, t_vals, ray_params, 
 
     #bulid Time tensor (H,W,N_sample,out_feat)
     timeTensor = torch.full_like(ray_dir_world[:,:,:1],fill_value=T_momen,dtype=torch.float32,device=ray_dir_world.device) #(H,W,1)
-    timeTensor = encode_position(timeTensor,levels = 4,inc_input=True)        #(H,W,9)
+    timeTensor = time_enc_Net(timeTensor)                                     #(H,W,9)
     timeTensor = time_pose_net(timeTensor)                                    #(H,W,27)
     timeTensor = timeTensor.unsqueeze(2).expand(-1,-1,ray_params.N_SAMPLE,-1) #(H,W,N_sample,27)
     
     # encode position: (H, W, N_sample, (2L+1)*C = 63)
-    pos_enc = encode_position(sample_pos, levels=ray_params.POS_ENC_FREQ, inc_input=True)
+    pos_enc = pos_enc_Net(sample_pos)
 
     #cat spatial and time
     tpos_enc = torch.cat([pos_enc,timeTensor],dim=-1) #(H,W,N_sample,63+27)
 
     # encode direction: (H, W, N_sample, (2L+1)*C = 27)
     ray_dir_world = F.normalize(ray_dir_world, p=2, dim=2)  # (H, W, 3)
-    dir_enc = encode_position(ray_dir_world, levels=ray_params.DIR_ENC_FREQ, inc_input=True)  # (H, W, 27)
+    dir_enc = dir_enc_Net(ray_dir_world)  # (H, W, 27)
     dir_enc = dir_enc.unsqueeze(2).expand(-1, -1, ray_params.N_SAMPLE, -1)  # (H, W, N_sample, 27)
 
     # inference rgb and density using position and direction encoding.
@@ -337,7 +381,8 @@ def model_render_image(time_pose_net,T_momen,c2w, rays_cam, t_vals, ray_params, 
     return result
 
 #***
-def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,opt_time, nerf_model, focal_net, pose_param_net,time_pose_net,flowComp,ArbTimeFlowIntrp,flowBackWarp):
+def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,opt_time,opt_pos_enc,opt_time_enc,opt_dir_enc,nerf_model, focal_net, pose_param_net,time_pose_net,
+                    flowComp,ArbTimeFlowIntrp,flowBackWarp,pos_enc_Net,time_enc_Net,dir_enc_Net):
 
     """
     images_data: {0:(N,H,W,C),1:(N,H,W,C),2:(N,H,W,C),...}   dictionary that stores images for each time step with N camera pose each
@@ -347,6 +392,10 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
     focal_net.train()
     pose_param_net.train()
     time_pose_net.train()
+
+    pos_enc_Net.train()
+    time_enc_Net.train()
+    dir_enc_Net.train()
 
     #set up
     mean = [0.429, 0.431, 0.397]
@@ -359,9 +408,7 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
 
     t_vals = torch.linspace(ray_params.NEAR, ray_params.FAR, ray_params.N_SAMPLE, device=device)  # (N_sample,) sample position
 
-    total_loss_epoch = []
     L2_loss_epoch = []
-    ssim_loss_epoch = []
     
     #shuffle the time steps
     time_list = [ i for i in range(TSteps-1)]
@@ -413,74 +460,47 @@ def train_one_epoch(images_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,
                 c2w = pose_param_net(i)  # (4, 4)
 
                 # sample 32x32 pixel on an image and their rays for training.
-                #row_list = [(rs_i,rs_i+100) for rs_i in range(H-100+1)]
-                #random.shuffle(row_list)
-                #col_list = [(cs_j,cs_j+64) for cs_j in range(W-64+1)]
-                #random.shuffle(col_list)
-
-                #row_start , row_end = row_list[0]
-                #col_start , col_end = col_list[0]
-                #ray_selected_cam = ray_dir_cam[row_start:row_end,col_start:col_end,:]
-                #img_selected = img[row_start:row_end,col_start:col_end,:]
-
-                row_start = torch.randperm(H-100+1,device=device)[0]
-                col_start = torch.randperm(W-64+1,device=device)[0]
-
-                ray_selected_cam = ray_dir_cam[row_start:row_start+100][:,col_start:col_start+64]
-                img_selected = img[row_start:row_start+100][:,col_start:col_start+64]
+                r_id = torch.randperm(H, device=device)[:100]  # (N_select_rows)
+                c_id = torch.randperm(W, device=device)[:64]  # (N_select_cols)
+                ray_selected_cam = ray_dir_cam[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
+                img_selected = img[r_id][:, c_id]  # (N_select_rows, N_select_cols, 3)
 
                 # render an image using selected rays, pose, sample intervals, and the network
-                render_result = model_render_image(time_pose_net,t_idx,c2w, ray_selected_cam, t_vals, ray_params,H, W, fxfy, nerf_model, perturb_t=True, sigma_noise_std=0.0)
+                render_result = model_render_image(t_idx,time_pose_net,pos_enc_Net,time_enc_Net,dir_enc_Net,c2w, ray_selected_cam, t_vals, ray_params,H, W, fxfy, nerf_model, perturb_t=True, sigma_noise_std=0.0)
                 rgb_rendered = render_result['rgb'] * 255.0  # (N_select_rows, N_select_cols, 3)
-                depth_rendered = render_result['depth_map'] * 200.0
 
-                #l1 loss
-                rgb_l1_loss = F.l1_loss(rgb_rendered/255.0,img_selected/255.0)
-                rgb_l1_loss = rgb_l1_loss
+                #l2 loss
+                L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
 
-                #ssim
-                ssim_syn = rearrange( rgb_rendered.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
-                ssim_tgt = rearrange( img_selected.unsqueeze(0), "b h w c -> b c h w") # (1,N_select_rows, N_select_cols, 3) -> (1,3,N_select_rows, N_select_cols)
-                rgb_ssim_loss =  1 - SSIM_loss(ssim_syn,ssim_tgt)
-                
-                #edge_aware_loss
-                disp =  torch.reciprocal(depth_rendered+1e-7) # (N_select_rows, N_select_cols)
-                EAL_loss = edge_aware_loss(img_selected,disp)
-
-                #total loss
-                total_loss = rgb_l1_loss + rgb_ssim_loss + 0.01*EAL_loss
-
-                #L2_loss.backward()
-                total_loss.backward()
+                L2_loss.backward()
                 opt_nerf.step()
                 opt_focal.step()
                 opt_pose.step()
                 opt_time.step()
+                opt_pos_enc.step()
+                opt_time_enc.step()
+                opt_dir_enc.step()
                 
                 opt_nerf.zero_grad()
                 opt_focal.zero_grad()
                 opt_pose.zero_grad()
                 opt_time.zero_grad()
+                opt_pos_enc.zero_grad()
+                opt_time_enc.zero_grad()
+                opt_dir_enc.zero_grad()
 
                 with torch.no_grad():
 
-                    L2_loss = F.mse_loss(rgb_rendered/255.0, img_selected/255.0)  # loss for one image
-                    #psnr_val = psnr(rgb_rendered,img_selected)
-                    L2_loss_epoch.append(L2_loss)
-                    ssim_loss_epoch.append((1-rgb_ssim_loss).clone().detach())
-                    total_loss_epoch.append(total_loss.clone().detach())
-
+                    L2_loss_epoch.append(L2_loss.clone().detach())
 
 
     L2_loss_epoch_mean = torch.stack(L2_loss_epoch).mean().item()
-    ssim_loss_epoch_mean = torch.stack(ssim_loss_epoch).mean().item()
-    total_loss_epoch_mean = torch.stack(total_loss_epoch).mean().item()
 
     #[L2_loss_epoch_mean,0,total_loss_epoch_mean]
-    return [L2_loss_epoch_mean,ssim_loss_epoch_mean,total_loss_epoch_mean]
+    return L2_loss_epoch_mean
 
 #Define evaluation function***
-def render_novel_view(T_momen,c2w, H, W, fxfy, ray_params, nerf_model,time_pose_net):
+def render_novel_view(T_momen,c2w, H, W, fxfy, ray_params, nerf_model,time_pose_net,pos_enc_Net,time_enc_Net,dir_enc_Net):
     nerf_model.eval()
 
     ray_dir_cam = comp_ray_dir_cam_fxfy(H, W, fxfy[0], fxfy[1])
@@ -496,7 +516,7 @@ def render_novel_view(T_momen,c2w, H, W, fxfy, ray_params, nerf_model,time_pose_
     for rays_dir_rows in rays_dir_cam_split_rows:
 
         
-        render_result = model_render_image(time_pose_net,T_momen,c2w, rays_dir_rows, t_vals, ray_params,
+        render_result = model_render_image(T_momen,time_pose_net,pos_enc_Net,time_enc_Net,dir_enc_Net,c2w, rays_dir_rows, t_vals, ray_params,
                                            H, W, fxfy, nerf_model,
                                            perturb_t=False, sigma_noise_std=0.0)
                                            
@@ -536,10 +556,34 @@ flowBackWarp = nn.DataParallel(flowBackWarp,device_ids=device_ids)
 flowBackWarp = flowBackWarp.to(device)
 
 #load model if required	
+pos_enc_Net = PosEncNet(levels=ray_params.POS_ENC_FREQ)
+if load_model:
+
+    pos_enc_Net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_pos_enc_Net_Dis_S.pt",map_location = device))
+
+pos_enc_Net = nn.DataParallel(pos_enc_Net,device_ids=device_ids)
+pos_enc_Net.to(device)
+
+time_enc_Net = PosEncNet(levels=4)
+if load_model:
+
+    time_enc_Net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_time_enc_Net_Dis_S.pt",map_location = device))
+
+time_enc_Net = nn.DataParallel(time_enc_Net,device_ids=device_ids)
+time_enc_Net.to(device)
+
+dir_enc_Net = PosEncNet(levels=ray_params.DIR_ENC_FREQ)
+if load_model:
+
+    dir_enc_Net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_dir_enc_Net_Dis_S.pt",map_location = device))
+
+dir_enc_Net = nn.DataParallel(dir_enc_Net,device_ids=device_ids)
+dir_enc_Net.to(device)
+
 focal_net = LearnFocal(H, W, req_grad=True)
 if load_model:
 
-    focal_net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_focal.pt",map_location = device))
+    focal_net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_focal_Dis_S.pt",map_location = device))
 
 focal_net = nn.DataParallel(focal_net,device_ids=device_ids)
 focal_net.to(device)
@@ -547,7 +591,7 @@ focal_net.to(device)
 pose_param_net = LearnPose(num_cams=N_IMGS, learn_R=True, learn_t=True)
 if load_model:
     
-    pose_param_net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_pose.pt",map_location = device))
+    pose_param_net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_pose_Dis_S.pt",map_location = device))
 
 pose_param_net = nn.DataParallel(pose_param_net,device_ids=device_ids)
 pose_param_net.to(device) 
@@ -555,7 +599,7 @@ pose_param_net.to(device)
 time_pose_net = LearnTime(in_feat=9,mid_feat=32,out_feat=27)
 if load_model:
 
-    time_pose_net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_time.pt",map_location = device))
+    time_pose_net.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_time_Dis_S.pt",map_location = device))
 
 time_pose_net = nn.DataParallel(time_pose_net,device_ids=device_ids)
 time_pose_net.to(device)
@@ -565,7 +609,7 @@ time_pose_net.to(device)
 nerf_model = Nerf(tpos_in_dims=90, dir_in_dims=27, D=256)
 if load_model:
 
-    nerf_model.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_nerf.pt",map_location = device))
+    nerf_model.load_state_dict(torch.load(f"{model_weight_dir}/{scene_name}_nerf_Dis_S.pt",map_location = device))
 
 nerf_model = nn.DataParallel(nerf_model,device_ids=device_ids)
 nerf_model.to(device)
@@ -577,10 +621,18 @@ opt_focal = torch.optim.Adam(focal_net.parameters(), lr=0.001)
 opt_pose = torch.optim.Adam(pose_param_net.parameters(), lr=0.001)
 opt_time = torch.optim.Adam(time_pose_net.parameters(), lr=0.001)
 
+opt_pos_enc = torch.optim.Adam(pos_enc_Net.parameters(),lr=0.001)
+opt_time_enc = torch.optim.Adam(time_enc_Net.parameters(),lr=0.001)
+opt_dir_enc = torch.optim.Adam(dir_enc_Net.parameters(),lr=0.001)
+
 scheduler_nerf = MultiStepLR(opt_nerf, milestones=list(range(0, 10000, 10)), gamma=0.9954)
 scheduler_focal = MultiStepLR(opt_focal, milestones=list(range(0, 10000, 100)), gamma=0.9)
 scheduler_pose = MultiStepLR(opt_pose, milestones=list(range(0, 10000, 100)), gamma=0.9)
 scheduler_time = MultiStepLR(opt_time, milestones=list(range(0, 10000, 100)), gamma=0.9)
+
+scheduler_pos_enc = MultiStepLR(opt_pos_enc, milestones=list(range(0, 10000, 100)), gamma=0.9)
+scheduler_time_enc = MultiStepLR(opt_time_enc, milestones=list(range(0, 10000, 100)), gamma=0.9)
+scheduler_dir_enc = MultiStepLR(opt_dir_enc, milestones=list(range(0, 10000, 100)), gamma=0.9)
 
 # Set tensorboard writer
 writer = SummaryWriter(log_dir=os.path.join('logs', scene_name, str(datetime.datetime.now().strftime('%y%m%d_%H%M%S'))))
@@ -589,25 +641,35 @@ writer = SummaryWriter(log_dir=os.path.join('logs', scene_name, str(datetime.dat
 print('Start Training...')
 for epoch_i in tqdm(range(N_EPOCH), desc='Training'):
     
-    Tr_loss = train_one_epoch(image_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,opt_time, nerf_model, focal_net, pose_param_net,time_pose_net,flowComp,ArbTimeFlowIntrp,flowBackWarp)
-    train_psnr = mse2psnr(Tr_loss[0])
+    Tr_loss = train_one_epoch(image_data, H, W, ray_params, opt_nerf, opt_focal,opt_pose,opt_time,opt_pos_enc,opt_time_enc,opt_dir_enc, nerf_model, focal_net, pose_param_net,time_pose_net,
+                              flowComp,ArbTimeFlowIntrp,flowBackWarp,pos_enc_Net,time_enc_Net,dir_enc_Net)
+
+    train_psnr = mse2psnr(Tr_loss)
  
     fxfy = focal_net()
     #print('epoch {0:4d} Training PSNR {1:.3f}, estimated fx {2:.1f} fy {3:.1f}'.format(epoch_i, train_psnr, fxfy[0], fxfy[1]))
-    print(f"epoch {epoch_i+1}: Training PSNR {train_psnr}, SSIM: {Tr_loss[1]}, Total Loss: {Tr_loss[2]}, estimated fx {fxfy[0]} fy {fxfy[1]}")
+    print(f"epoch {epoch_i+1}: Training PSNR {train_psnr}, estimated fx {fxfy[0]} fy {fxfy[1]}")
 
     scheduler_nerf.step()
     scheduler_focal.step()
     scheduler_pose.step()
     scheduler_time.step()
 
+    scheduler_pos_enc.step()
+    scheduler_time_enc.step()
+    scheduler_dir_enc.step()
+
     learned_c2ws = torch.stack([pose_param_net(i) for i in range(N_IMGS)])  # (N, 4, 4)
     
     #save check point
-    torch.save(nerf_model.module.state_dict(),f"{model_weight_dir}/{scene_name}_nerf.pt")
-    torch.save(focal_net.module.state_dict(),f"{model_weight_dir}/{scene_name}_focal.pt")
-    torch.save(pose_param_net.module.state_dict(),f"{model_weight_dir}/{scene_name}_pose.pt")
-    torch.save(time_pose_net.module.state_dict(),f"{model_weight_dir}/{scene_name}_time.pt")
+    torch.save(nerf_model.module.state_dict(),f"{model_weight_dir}/{scene_name}_nerf_Dis_S.pt")
+    torch.save(focal_net.module.state_dict(),f"{model_weight_dir}/{scene_name}_focal_Dis_S.pt")
+    torch.save(pose_param_net.module.state_dict(),f"{model_weight_dir}/{scene_name}_pose_Dis_S.pt")
+    torch.save(time_pose_net.module.state_dict(),f"{model_weight_dir}/{scene_name}_time_Dis_S.pt")
+
+    torch.save(pos_enc_Net.module.state_dict(),f"{model_weight_dir}/{scene_name}_pos_enc_Net_Dis_S.pt")
+    torch.save(time_enc_Net.module.state_dict(),f"{model_weight_dir}/{scene_name}_time_enc_Net_Dis_S.pt")
+    torch.save(dir_enc_Net.module.state_dict(),f"{model_weight_dir}/{scene_name}_dir_enc_Net_Dis_S.pt")
 
 
     with torch.no_grad():
@@ -616,9 +678,9 @@ for epoch_i in tqdm(range(N_EPOCH), desc='Training'):
             
             eval_c2w = torch.eye(4, dtype=torch.float32)  # (4, 4)
             fxfy = focal_net()
-            rendered_img, rendered_depth = render_novel_view(((epoch_i+1)%TSteps)/TSteps,eval_c2w, H, W, fxfy, ray_params, nerf_model,time_pose_net)
-            imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_img{epoch_i+1}_SlMo.png"),(rendered_img*255).cpu().numpy().astype(np.uint8))
-            imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_depth{epoch_i+1}_SlMoF.png"),(rendered_depth*200).cpu().numpy().astype(np.uint8))
+            rendered_img, rendered_depth = render_novel_view(((epoch_i+1)%TSteps)/TSteps,eval_c2w, H, W, fxfy, ray_params, nerf_model,time_pose_net,pos_enc_Net,time_enc_Net,dir_enc_Net)
+            imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_img{epoch_i+1}_SlMo_Dis_S.png"),(rendered_img*255).cpu().numpy().astype(np.uint8))
+            imageio.imwrite(os.path.join(f"{os.getcwd()}/nvs_midImg/{scene_name}", scene_name + f"_depth{epoch_i+1}_SlMo_Dis_S.png"),(rendered_depth*200).cpu().numpy().astype(np.uint8))
 
 
 
@@ -648,7 +710,7 @@ with torch.no_grad():
     print('Rendering novel views in {0:d} x {1:d}'.format(novel_H, novel_W))
 
     #time moment
-    t = np.linspace(start=0,stop=1,num=num_steps,endpoint=True)
+    t = np.linspace(start=0,stop=1,num=num_steps,endpoint=False)
     
     novel_img_list, novel_depth_list = [], []
 
@@ -658,7 +720,7 @@ with torch.no_grad():
     #render images
     for i in tqdm(range(spiral_c2ws.shape[0]), desc='novel view rendering'):
         
-        novel_img, novel_depth = render_novel_view(t[i],spiral_c2ws[i], novel_H, novel_W, novel_fxfy,ray_params, nerf_model,time_pose_net)
+        novel_img, novel_depth = render_novel_view(t[i],spiral_c2ws[i], novel_H, novel_W, novel_fxfy,ray_params, nerf_model,time_pose_net,pos_enc_Net,time_enc_Net,dir_enc_Net)
         
         novel_img_list.append(novel_img)
         novel_depth_list.append(novel_depth)
@@ -669,6 +731,6 @@ with torch.no_grad():
     novel_depth_list = (torch.stack(novel_depth_list) * 200).cpu().numpy().astype(np.uint8)  # depth is always in 0 to 1 in NDC
 
     #os.makedirs('nvs_results', exist_ok=True)
-    imageio.mimwrite(os.path.join(f"{os.getcwd()}/nvs_result", scene_name + '_img.gif'), novel_img_list, fps=30)
-    imageio.mimwrite(os.path.join(f"{os.getcwd()}/nvs_result", scene_name + '_depth.gif'), novel_depth_list, fps=30)
+    imageio.mimwrite(os.path.join(f"{os.getcwd()}/nvs_result", scene_name + '_img_Dis_S.gif'), novel_img_list, fps=30)
+    imageio.mimwrite(os.path.join(f"{os.getcwd()}/nvs_result", scene_name + '_depth_Dis_S.gif'), novel_depth_list, fps=30)
     print('GIF images saved.')

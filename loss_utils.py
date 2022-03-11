@@ -84,7 +84,7 @@ def ssim(img1, img2, window_size=11, size_average=True):
 
 
 class VGGPerceptualLoss(torch.nn.Module):
-    def __init__(self, resize=True):
+    def __init__(self, resize=True,device=torch.device("cuda:0")):
         super(VGGPerceptualLoss, self).__init__()
         blocks = []
         blocks.append(torchvision.models.vgg16(pretrained=True).features[:4].eval())
@@ -96,8 +96,8 @@ class VGGPerceptualLoss(torch.nn.Module):
                 p.requires_grad = False
         self.blocks = torch.nn.ModuleList(blocks)
         self.transform = torch.nn.functional.interpolate
-        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).cuda()
-        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).cuda()
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)#.cuda()
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)#.cuda()
         self.mean.requires_grad = False
         self.std.requires_grad = False
         self.resize = resize
@@ -211,16 +211,16 @@ def edge_sharpen_loss(img, dep):
     depth_normalizing_constant = torch.max(dep).clone().detach()
     normalize_disp = dep / (depth_normalizing_constant + 1e-7)
 
-    grad_dep_x = torch.square(normalize_disp[:,1:] - normalize_disp[:,:-1]) #(H,W-1)
-    grad_dep_y = torch.square(normalize_disp[1:,:] - normalize_disp[:-1,:]) #(H-1,W)
+    grad_dep_x = torch.abs(normalize_disp[:,1:] - normalize_disp[:,:-1]) #(H,W-1)
+    grad_dep_y = torch.abs(normalize_disp[1:,:] - normalize_disp[:-1,:]) #(H-1,W)
 
     #img
     img_normalizing_constant = torch.max(img).clone().detach()
     normalize_img = img / (img_normalizing_constant + 1e-7)
 
-    grad_img_x = torch.mean(torch.square(normalize_img[:,1:,:] - normalize_img[:,:-1,:]), dim=-1, keepdim=False )#(H,W-1)
-    grad_img_y = torch.mean(torch.square(normalize_img[1:,:,:] - normalize_img[:-1,:,:]), dim=-1, keepdim=False )#(H-1,W)
+    grad_img_x = torch.mean(torch.abs(normalize_img[:,1:,:] - normalize_img[:,:-1,:]), dim=-1, keepdim=False )#(H,W-1)
+    grad_img_y = torch.mean(torch.abs(normalize_img[1:,:,:] - normalize_img[:-1,:,:]), dim=-1, keepdim=False )#(H-1,W)
 
-    grad_result = torch.square(grad_dep_x - grad_img_x).mean() + torch.square(grad_dep_y - grad_img_y).mean()
+    grad_result = torch.abs(grad_dep_x - grad_img_x).mean() + torch.abs(grad_dep_y - grad_img_y).mean()
 
     return grad_result
